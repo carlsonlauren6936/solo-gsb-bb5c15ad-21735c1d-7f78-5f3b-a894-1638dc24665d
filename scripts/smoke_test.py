@@ -151,6 +151,132 @@ def test_guarded_rebuild_on_consecutive_anomalies() -> None:
     print("✓ guarded 连续异常：达 rebase_after 重建基线并递增代次，触发点仍异常、区间不拆分")
 
 
+def _gap_series() -> tuple[list[str], list[float]]:
+    """两段规则 5 分钟采样（各 14 点），中间断开 10 小时；基线水位 10。"""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 20, 8, 0, 0, tzinfo=timezone.utc)
+    timestamps: list[str] = []
+    values: list[float] = []
+    t = base
+    for _ in range(14):
+        timestamps.append(t.isoformat())
+        values.append(10.0)
+        t += timedelta(minutes=5)
+    t = base + timedelta(hours=10)  # 大断档（常规间隔的 120 倍）
+    for _ in range(14):
+        timestamps.append(t.isoformat())
+        values.append(10.0)
+        t += timedelta(minutes=5)
+    return timestamps, values
+
+
+def test_gap_aware_split_and_warmup() -> None:
+    """启用 gap_reset_factor：断档切分、间隔估计、逐段预热与逐点分段编号。"""
+    ts, values = _gap_series()
+    values[13] = 20.0  # 第一段末点尖刺
+
+    result = analyze_series(
+        ts, values, window_size=10, min_window=5, threshold=3.0,
+        merge_gap=2, gap_reset_factor=3.0,
+    )
+    assert result["gap_reset_factor"] == 3.0
+    assert result["estimated_interval_seconds"] == 300.0
+    assert result["sampling_segment_count"] == 2
+    assert len(result["gap_boundaries"]) == 1
+    gap = result["gap_boundaries"][0]
+    assert gap["before_index"] == 13 and gap["after_index"] == 14
+    # 段 0 末点 = base+65min，段 1 首点 = base+10h，差 535min
+    assert gap["gap_seconds"] == 10 * 3600 - 65 * 60
+    assert gap["gap_ratio"] == gap["gap_seconds"] / 300.0
+
+    # 两段各自预热 5 个点：评估点为 5..13 与 19..27，共 18 个
+    evaluated = [p["index"] for p in result["points"]]
+    assert evaluated == list(range(5, 14)) + list(range(19, 28))
+    assert result["evaluated_point_count"] == 18
+    seg_of = {p["index"]: p["sampling_segment_index"] for p in result["points"]}
+    assert all(seg_of[i] == 0 for i in range(5, 14))
+    assert all(seg_of[i] == 1 for i in range(19, 28))
+
+    # 第一段尖刺被标记，且区间带分段编号
+    assert [(s["start_index"], s["sampling_segment_index"]) for s in result["segments"]] == [(13, 0)]
+    print("✓ 断档感知：间隔估计、断档边界、逐段预热与逐点分段编号正确")
+
+
+def test_gap_aware_baseline_restart_and_no_merge_across_gap() -> None:
+    """断档后基线从头：新水位不误报；merge_gap 再大，异常区间也不跨断档合并。"""
+    from datetime import datetime, timedelta, timezone
+
+    # 场景一：断档后水位迁移到 20，独立预热后不应报异常
+    ts, values = _gap_series()
+    values[14:] = [20.0] * 14
+    gapped = analyze_series(
+        ts, values, window_size=10, min_window=5, threshold=3.0, gap_reset_factor=3.0
+    )
+    plain = analyze_series(
+        ts, values, window_size=10, min_window=5, threshold=3.0
+    )
+    assert gapped["anomaly_segment_count"] == 0
+    # 不启用时，断档后早期点仍拿 10 的旧基线评分，会误报一段
+    assert plain["anomaly_segment_count"] >= 1
+
+    # 场景二：断档两侧各有异常，merge_gap=10 也不得合并
+    ts2, values2 = _gap_series()
+    values2[13] = 30.0  # 段 0 末点
+    values2[19] = 30.0  # 段 1 首个可评估点（14..18 预热，19 起评分）
+    merged = analyze_series(
+        ts2, values2, window_size=10, min_window=5, threshold=3.0,
+        merge_gap=10, gap_reset_factor=3.0,
+    )
+    assert [(s["start_index"], s["end_index"]) for s in merged["segments"]] == [(13, 13), (19, 19)]
+    assert [s["sampling_segment_index"] for s in merged["segments"]] == [0, 1]
+    # 同参数不启用断档时会被桥接成一个跨断档区间
+    merged_plain = analyze_series(
+        ts2, values2, window_size=10, min_window=5, threshold=3.0, merge_gap=10
+    )
+    assert [(s["start_index"], s["end_index"]) for s in merged_plain["segments"]] == [(13, 19)]
+    print("✓ 断档感知：断档后基线从头避免水位迁移误报，且异常区间不跨断档合并")
+
+
+def test_gap_aware_guarded_resets_state() -> None:
+    """guarded + 断档：第二段连续异常计数与重建代次从头开始。"""
+    ts, values = _gap_series()
+    # 第一段放一个长水平偏移触发一次重建；第二段同样偏移
+    values[10:14] = [30.0] * 4
+    values[23:27] = [30.0] * 4
+
+    result = analyze_series(
+        ts, values, window_size=10, min_window=3, threshold=3.0,
+        merge_gap=2, baseline_policy="guarded", gap_reset_factor=3.0,
+    )
+    by_index = {p["index"]: p for p in result["points"]}
+    # 第一段的重建点 i=12（10,11,12 连续 3 异常，rebase_after 默认=min_window=3）
+    assert by_index[12]["baseline_reset"] is True
+    assert by_index[12]["baseline_generation"] == 0  # 触发点按旧代次评分
+    # 第二段同样在 i=25 触发重建，且代次从 0 重新计数（未受第一段重建影响）
+    assert by_index[25]["baseline_reset"] is True
+    assert by_index[25]["baseline_generation"] == 0
+    assert by_index[26]["baseline_generation"] == 1  # 重建后首个点用新代次
+    # 两段各重建一次
+    assert result["baseline_rebuild_count"] == 2
+    print("✓ 断档感知 guarded：连续异常计数与重建代次在每段起点重置")
+
+
+def test_gap_aware_defaults_compatible() -> None:
+    """未启用 gap_reset_factor 时响应字段取兼容默认值。"""
+    ts, values = _gap_series()
+    result = analyze_series(
+        ts, values, window_size=10, min_window=5, threshold=3.0, merge_gap=2
+    )
+    assert result["gap_reset_factor"] is None
+    assert result["estimated_interval_seconds"] is None
+    assert result["gap_boundaries"] == []
+    assert result["sampling_segment_count"] == 1
+    assert all(p["sampling_segment_index"] == 0 for p in result["points"])
+    assert all(s["sampling_segment_index"] == 0 for s in result["segments"])
+    print("✓ 断档感知默认关闭：新增字段全部取兼容默认值")
+
+
 def test_api_end_to_end(tmp_db: str = "/tmp/tsad_smoke.db") -> None:
     import os
 
@@ -255,6 +381,63 @@ def _exercise_api(client: "TestClient") -> None:
     r = client.post("/api/v1/detections", json=bad)
     assert r.status_code == 422
 
+    # 断档感知：两段规则采样 + 中间大断档，返回边界 / 间隔 / 逐点分段编号
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 9, 20, 20, 0, 0, tzinfo=timezone.utc)
+    gap_points = []
+    t = base
+    for i in range(12):
+        gap_points.append({"timestamp": t.isoformat(), "value": 10.0 + 0.05 * (i % 2)})
+        t += timedelta(minutes=5)
+    t = base + timedelta(hours=10)
+    for i in range(12):
+        gap_points.append({"timestamp": t.isoformat(), "value": 20.0 + 0.05 * (i % 2)})
+        t += timedelta(minutes=5)
+    gap_payload = {
+        "series_id": "test-series-gap",
+        "window_size": 10,
+        "min_window": 3,
+        "threshold": 3.0,
+        "merge_gap": 1,
+        "gap_reset_factor": 3.0,
+        "include_points": True,
+        "points": gap_points,
+    }
+    r = client.post("/api/v1/detections", json=gap_payload)
+    assert r.status_code == 201, r.text
+    gp = r.json()
+    assert gp["gap_reset_factor"] == 3.0
+    assert gp["estimated_interval_seconds"] == 300.0
+    assert gp["sampling_segment_count"] == 2
+    assert len(gp["gap_boundaries"]) == 1
+    gb = gp["gap_boundaries"][0]
+    assert gb["before_index"] == 11 and gb["after_index"] == 12
+    # 断档后水位 20 独立预热，不产生误报
+    assert gp["anomaly_segment_count"] == 0
+    assert all("sampling_segment_index" in p for p in gp["points"])
+    assert {p["sampling_segment_index"] for p in gp["points"]} == {0, 1}
+
+    # 历史结果取回时间断档字段持久化保留
+    gap_id = gp["id"]
+    r = client.get(f"/api/v1/detections/{gap_id}")
+    assert r.status_code == 200
+    assert r.json()["sampling_segment_count"] == 2
+    assert r.json()["gap_boundaries"][0]["gap_seconds"] == gb["gap_seconds"]
+
+    # 参数校验：启用断档但点数 < 3
+    bad = dict(gap_payload)
+    bad["points"] = gap_points[:2]
+    r = client.post("/api/v1/detections", json=bad)
+    assert r.status_code == 422
+    assert "gap_reset_factor" in r.text
+
+    # 参数校验：gap_reset_factor 必须 > 1
+    bad = dict(gap_payload)
+    bad["gap_reset_factor"] = 1.0
+    r = client.post("/api/v1/detections", json=bad)
+    assert r.status_code == 422
+
     print("✓ API 端到端测试通过：提交 / 查询 / 列表 / 404 / 参数校验 / guarded 策略")
 
 
@@ -265,5 +448,9 @@ if __name__ == "__main__":
     test_rolling_defaults_unchanged()
     test_guarded_isolated_spike_excluded()
     test_guarded_rebuild_on_consecutive_anomalies()
+    test_gap_aware_split_and_warmup()
+    test_gap_aware_baseline_restart_and_no_merge_across_gap()
+    test_gap_aware_guarded_resets_state()
+    test_gap_aware_defaults_compatible()
     test_api_end_to_end()
     print("\n全部冒烟测试通过 ✅")

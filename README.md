@@ -12,6 +12,7 @@
   - `rolling`（默认）：所有历史点一律滑入基线窗口，行为与早期版本完全一致；
   - `guarded`：只有判为正常的点才允许进入后续基线，孤立尖刺不会污染其后的中位数与离散度；当连续异常达到 `rebase_after` 个点（默认等于 `min_window`，且不得更小）时，用该异常段最近 `min_window` 个点重建基线并递增基线代次（generation）。触发重建的点仍保持异常，原异常区间也不会被拆分。
 - **区间合并**：相邻触发点间隔不超过 `merge_gap + 1` 个点时合并为一个异常区间（能把一次持续数点的水平偏移归为一段；guarded 重建不参与区间拆分）。
+- **采样断档感知 `gap_reset_factor`**（可选，默认关闭）：以排序后相邻点**正时间差的中位数**估算常规采样间隔，相邻间隔超过 `gap_reset_factor` 倍即判定为断档并切分采样分段。每个分段独立执行 `min_window` 预热，rolling/guarded 的基线、guarded 的连续异常计数与重建代次都在分段起点从头开始，异常区间**绝不跨越断档合并**。响应返回断档边界、估算间隔与逐点 / 逐区间的分段编号；断档后即使水位整体迁移，也不会拿断档前的旧基线误报。
 - **可解释结果**：每段返回基线窗口、最大/平均 |z|、全部触发点及中文原因说明。
 - **持久化检索**：SQLite（WAL 模式）保存完整结果，按检测 ID 查询，可按业务 `series_id` 过滤、分页列出。
 - **接口文档**：启动后访问 Swagger UI `/docs`、ReDoc `/redoc`。
@@ -28,7 +29,8 @@
 │   └── database.py    # SQLite 存储层
 ├── examples/
 │   ├── request.json          # rolling 示例请求（含一次上升突变与一次下降突变）
-│   └── request_guarded.json  # guarded 示例请求（孤立尖刺 + 水平偏移重建基线）
+│   ├── request_guarded.json  # guarded 示例请求（孤立尖刺 + 水平偏移重建基线）
+│   └── request_gap.json      # 断档感知示例请求（两段采样，水位迁移 + 各自尖刺）
 ├── scripts/
 │   └── smoke_test.py  # 算法 + API 端到端冒烟测试
 ├── data/              # SQLite 数据库目录（compose 挂载命名卷）
@@ -84,9 +86,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 | `merge_gap` | int | 2 | 合并区间时允许桥接的连续正常点数 |
 | `baseline_policy` | string | `rolling` | 基线策略：`rolling`=所有历史点滑入基线（默认）；`guarded`=仅正常点进入基线，连续异常达到 `rebase_after` 时重建基线 |
 | `rebase_after` | int \| null | `null` | guarded 模式下触发基线重建的连续异常点数，省略时取 `min_window`；必须不小于 `min_window`。rolling 模式忽略该字段 |
+| `gap_reset_factor` | float \| null | `null` | 采样断档感知倍数（必须 **>1**）。设置后以相邻点正时间差的中位数估算常规采样间隔，间隔超过该倍数即切分新分段，每段独立预热并独立维护基线 / 连续异常计数 / 重建代次，异常区间不跨断档合并。启用至少需要 **3 个点**（少于 3 个点返回 422 校验错误）；省略或为 `null` 时功能关闭，结果与旧版完全兼容 |
 | `include_points` | bool | false | 响应是否带逐点注解（完整结果始终入库） |
 
-约束：`min_window ≤ window_size`；点数必须大于 `min_window`；guarded 模式下 `rebase_after ≥ min_window`。
+约束：`min_window ≤ window_size`；点数必须大于 `min_window`；guarded 模式下 `rebase_after ≥ min_window`；启用 `gap_reset_factor` 时点数必须 ≥ 3。
 
 ### `GET /api/v1/detections/{id}` — 按 ID 查询
 
@@ -125,7 +128,24 @@ curl -s -X POST http://localhost:8000/api/v1/detections \
   -d @examples/request_guarded.json | python -m json.tool
 ```
 
-内联 JSON 示例：
+### 采样断档感知（gap_reset_factor）
+
+```bash
+# 两段规则 5 分钟采样，中间有约 11 小时断档；第二段水位整体迁移到 20。
+# 估算常规间隔 = 300s，09:10 -> 20:00 的间隔远超 3 倍而切分为两段：
+# 每段独立预热，第二段不会拿 10 的旧基线误报；两个尖刺也不会跨断档合并。
+curl -s -X POST http://localhost:8000/api/v1/detections \
+  -H "Content-Type: application/json" \
+  -d @examples/request_gap.json | python -m json.tool
+```
+
+响应中关注：
+
+- 摘要 `gap_reset_factor`（回显倍数）、`estimated_interval_seconds`（估算常规间隔，秒）、`sampling_segment_count`（采样分段数）；
+- `gap_boundaries[]`：每个断档边界包含 `before_index/after_index`、`before_time/after_time`、`gap_seconds`（断档实际时长）、`interval_seconds`（常规间隔）与 `gap_ratio`（倍数）；
+- 逐点注解与异常区间上的 `sampling_segment_index`（所属采样分段编号，从 0 开始）。
+
+### 内联 JSON 示例
 
 ```bash
 curl -s -X POST http://localhost:8000/api/v1/detections \
@@ -187,6 +207,10 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
   "baseline_policy": "rolling",
   "rebase_after": null,
   "baseline_rebuild_count": 0,
+  "gap_reset_factor": null,
+  "estimated_interval_seconds": null,
+  "gap_boundaries": [],
+  "sampling_segment_count": 1,
   "segments": [
     {
       "start_index": 24,
@@ -195,6 +219,7 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
       "end_time": "2026-09-20T10:10:00+00:00",
       "point_count": 3,
       "anomaly_point_count": 3,
+      "sampling_segment_index": 0,
       "baseline": {
         "median": 10.05,
         "mad": 0.1,
@@ -238,8 +263,15 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
 
 逐点注解（`points[]`）额外包含：
 
-- `baseline_generation`：评分该点时使用的基线代次。rolling 恒为 `0`；guarded 初始为 `0`，每发生一次重建递增，注意触发重建的点本身仍按旧代次基线评分。
+- `baseline_generation`：评分该点时使用的基线代次。rolling 恒为 `0`；guarded 初始为 `0`，每发生一次重建递增，注意触发重建的点本身仍按旧代次基线评分；启用断档感知时代次在每个采样分段内从 `0` 重新计数。
 - `baseline_reset`：该点是否为重建触发点（连续异常达到 `rebase_after`）。重建后基线整体替换为该异常段最近 `min_window` 个点，触发点仍标记为异常。
+- `sampling_segment_index`：该点所属采样分段编号（从 `0` 开始）；未启用 `gap_reset_factor` 时恒为 `0`。异常区间对象上也带同名字段。
+
+启用 `gap_reset_factor` 时摘要额外返回：
+
+- `estimated_interval_seconds`：排序后相邻点**正时间差的中位数**（常规采样间隔估计，秒）；
+- `gap_boundaries[]`：每个断档边界包含 `before_index` / `after_index`（断档前后相邻点索引）、`before_time` / `after_time`、`gap_seconds`（断档两侧实际时间差）、`interval_seconds`（常规间隔）与 `gap_ratio`（断档相对常规间隔的倍数）；
+- `sampling_segment_count`：采样分段总数。
 
 ## 算法说明
 
@@ -247,12 +279,13 @@ requests.get(f"http://localhost:8000/api/v1/detections/{result['id']}")
    - rolling：`values[max(0, i-window_size):i]`，连续 trailing window；
    - guarded：当前已接纳点中最近的至多 `window_size` 个——初始为前 `min_window` 个种子点，之后**只有判为正常的点**才会被接纳，异常点一律排除。
 2. 计算窗口中位数 `med` 与 MAD；稳健尺度 `σ = 1.4826 × MAD`，MAD=0 时回退样本标准差。
-3. `z_i = (x_i − med) / σ`，`|z_i| ≥ threshold` 标记为触发点；`σ = 0` 且 `x_i ≠ med` 时 `z_i = 999`。
+3. `z_i = (x_i − med) / σ`，`|z_i| ≥ threshold` 标记为触发点；`σ = 0` 且 `x_i ≠ med` 时 `z = 999`。
 4. guarded 模式维护「连续异常计数」：
    - 出现正常点即清零，且该点滑入基线（孤立尖刺因此被永久排除在后续窗口之外，直到随窗口老化）；
    - 连续异常达到 `rebase_after`（默认 `min_window`，必须 `≥ min_window`）时，用该异常段最近 `min_window` 个点整体替换基线、代次加一、连续计数清零；触发点仍是异常，且随后的区间合并照常进行，重建不会把原异常区间拆开。
 5. 扫描触发点序列：若相邻两个触发点索引差 `≤ merge_gap + 1`，则把中间正常点桥接，合并成一个异常区间（与策略无关）。
 6. 每段输出：首个触发点评分时实际使用的基线窗口、段内最大/平均 |z| 与峰值时刻、全部触发点（含各自窗口基线与原因）、整段中文解释。
+7. **采样断档感知（可选）**：仅当请求带 `gap_reset_factor > 1` 时启用。先以排序后相邻点正时间差的中位数估算常规间隔 `Δ`，相邻间隔 `> gap_reset_factor · Δ` 即切分采样分段；随后步骤 1~5 在每个分段内独立进行——每段前 `min_window` 个点重新预热不评分，rolling/guarded 基线从空建立，guarded 的连续异常计数与重建代次归零，区间桥接扫描被严格限制在分段内（不跨断档）。未启用时整段序列视为唯一分段，行为与旧版完全一致。
 
 与基于均值/标准差的方案相比，中位数 + MAD 对窗口内少量离群点不敏感，能在尖刺和水平偏移共存时给出稳定基线；guarded 策略进一步保证异常点（除触发重建的长异常段末尾 `min_window` 个点外）不参与基线，适合存在真实水位迁移、又不希望偶发尖刺抬高离散度的场景。
 
@@ -263,7 +296,7 @@ pip install -r requirements.txt httpx
 python scripts/smoke_test.py
 ```
 
-测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window` 与非法策略）。
+测试覆盖：单点突变、持续水平偏移的识别与合并、恒定基线退化处理、无异常数据、rolling 默认行为不变、guarded 孤立尖刺隔离与连续异常重建（代次/不拆区间/自定义 `rebase_after`）、采样断档感知（间隔估计与边界、逐段预热与逐点分段编号、断档后基线从头避免水位迁移误报、区间不跨断档合并、guarded 状态逐段重置、默认关闭兼容）、接口提交/查询/列表/404/参数校验（含 `rebase_after < min_window`、非法策略、启用断档但点数 < 3 与 `gap_reset_factor ≤ 1`）。
 
 ## 备注
 
