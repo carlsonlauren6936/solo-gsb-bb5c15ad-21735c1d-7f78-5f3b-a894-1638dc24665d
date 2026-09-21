@@ -91,12 +91,26 @@ class DetectRequest(BaseModel):
             "且不得小于 min_window）；rolling 模式忽略"
         ),
     )
+    gap_reset_factor: float | None = Field(
+        default=None,
+        gt=1.0,
+        le=10_000,
+        description=(
+            "采样断档感知倍数（>1）：以排序后相邻点正时间差的中位数估算常规"
+            "采样间隔，相邻点间隔超过该倍数即划分新分段，各分段独立预热与"
+            "维护基线；省略（默认）时关闭。启用时至少需要 3 个点"
+        ),
+    )
     include_points: bool = Field(
         default=False, description="响应是否包含逐点注解（存储中始终保留）"
     )
 
     @model_validator(mode="after")
     def _check_windows(self) -> "DetectRequest":
+        if self.gap_reset_factor is not None and len(self.points) < 3:
+            raise ValueError(
+                f"启用 gap_reset_factor 至少需要 3 个点，当前只有 {len(self.points)} 个"
+            )
         if self.min_window > self.window_size:
             raise ValueError("min_window 不能大于 window_size")
         if len(self.points) <= self.min_window:
@@ -147,6 +161,19 @@ class Trigger(BaseModel):
     reason: str
 
 
+class GapBoundary(BaseModel):
+    """采样断档边界：相邻两点间隔显著大于常规采样间隔。"""
+
+    before_index: int
+    after_index: int
+    before_time: str
+    after_time: str
+    gap_seconds: float = Field(description="断档两侧相邻点的时间差（秒）")
+    gap_ratio: float = Field(description="断档间隔对估算的常规采样间隔的倍数")
+    left_segment: int = Field(description="断档左侧采样分段编号（从 0 起）")
+    right_segment: int = Field(description="断档右侧采样分段编号（从 0 起）")
+
+
 class AnomalySegment(BaseModel):
     start_index: int
     end_index: int
@@ -158,6 +185,10 @@ class AnomalySegment(BaseModel):
     score: SegmentScore
     triggers: list[Trigger]
     explanation: str
+    segment: int | None = Field(
+        default=None,
+        description="所属采样分段编号（从 0 起）；未启用 gap_reset_factor 时为 null",
+    )
 
 
 class AnnotatedPoint(BaseModel):
@@ -179,6 +210,13 @@ class AnnotatedPoint(BaseModel):
         default=False,
         description="该点是否触发了基线重建（用其所在异常段末尾 min_window 个点重建）",
     )
+    segment: int = Field(
+        default=0,
+        description=(
+            "该点所属的采样分段编号（从 0 起）；启用 gap_reset_factor 时按断档"
+            "边界递增，未启用时恒为 0"
+        ),
+    )
 
 
 class DetectSummary(BaseModel):
@@ -190,6 +228,22 @@ class DetectSummary(BaseModel):
     baseline_policy: Literal["rolling", "guarded"] = "rolling"
     rebase_after: int | None = None
     baseline_rebuild_count: int = Field(default=0, description="guarded 模式基线重建（代次递增）次数")
+    gap_reset_factor: float | None = Field(
+        default=None, description="采样断档感知倍数；未启用时为 null"
+    )
+    estimated_interval_seconds: float | None = Field(
+        default=None,
+        description=(
+            "排序后相邻点正时间差的中位数估算出的常规采样间隔（秒）；"
+            "未启用 gap_reset_factor 或无法估算（时间戳全相同）时为 null"
+        ),
+    )
+    sampling_segment_count: int = Field(
+        default=1, description="按断档边界切分后的采样分段数；未启用时恒为 1"
+    )
+    gap_boundaries: list[GapBoundary] = Field(
+        default_factory=list, description="采样断档边界列表，按时间顺序排列"
+    )
     evaluated_start_index: int
     evaluated_point_count: int
     anomaly_point_count: int

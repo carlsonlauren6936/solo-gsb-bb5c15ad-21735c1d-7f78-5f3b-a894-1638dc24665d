@@ -15,12 +15,19 @@
   其后的中位数与离散度；当连续异常点数达到 ``rebase_after`` 时，用该异常
   段最近 ``min_window`` 个点重建基线并递增代次（generation），触发点本身
   仍保持异常，且区间不因此被拆分。
+
+采样断档感知 ``gap_reset_factor``（可选，>1）：
+启用后以排序后相邻点正时间差的中位数估算常规采样间隔，相邻点间隔超过
+``gap_reset_factor`` 倍估算间隔即切分为新的采样分段；每个分段独立执行
+``min_window`` 预热，rolling/guarded 的基线、连续异常计数与重建代次全部
+从头开始，异常区间也不允许跨越断档合并。
 """
 
 from __future__ import annotations
 
 import math
 from collections import deque
+from datetime import datetime
 from statistics import median
 from typing import Any
 
@@ -64,6 +71,61 @@ def _zscore(value: float, med: float, robust_sd: float) -> tuple[float, bool]:
     return (value - med) / robust_sd, False
 
 
+def _compute_sampling_segments(
+    timestamps: list[str], gap_reset_factor: float | None
+) -> tuple[list[tuple[int, int]], list[dict[str, Any]], float | None]:
+    """按采样断档切分排序后的序列。
+
+    返回 ``(segments, gap_boundaries, median_interval_seconds)``：
+    - ``segments``：``[start, end)`` 形式的分段索引范围，覆盖全部点；
+    - ``gap_boundaries``：每个断档一条记录，给出断档前后的点、间隔秒数、
+      倍数及两侧分段编号；
+    - ``median_interval_seconds``：相邻点正时间差的中位数（秒）；未启用
+      断档感知，或没有正时间差可估算（所有时间戳相同）时为 ``None``。
+
+    时间戳已在请求层去重，但这里仍只统计正时间差（非正差值不参与中位数
+    估算，也不会被当作断档）。
+    """
+    n = len(timestamps)
+    if gap_reset_factor is None:
+        return [(0, n)], [], None
+
+    dts = [datetime.fromisoformat(ts) for ts in timestamps]
+    deltas = [
+        (dts[i] - dts[i - 1]).total_seconds()
+        for i in range(1, n)
+        if (dts[i] - dts[i - 1]).total_seconds() > 0
+    ]
+    if not deltas:
+        return [(0, n)], [], None
+
+    median_interval = median(deltas)
+    boundaries: list[dict[str, Any]] = []
+    segments: list[tuple[int, int]] = []
+    start = 0
+    segment_id = 0
+    for i in range(1, n):
+        delta = (dts[i] - dts[i - 1]).total_seconds()
+        if delta > 0 and median_interval > 0 and delta > median_interval * gap_reset_factor:
+            segments.append((start, i))
+            boundaries.append(
+                {
+                    "before_index": i - 1,
+                    "after_index": i,
+                    "before_time": timestamps[i - 1],
+                    "after_time": timestamps[i],
+                    "gap_seconds": delta,
+                    "gap_ratio": delta / median_interval,
+                    "left_segment": segment_id,
+                    "right_segment": segment_id + 1,
+                }
+            )
+            start = i
+            segment_id += 1
+    segments.append((start, n))
+    return segments, boundaries, median_interval
+
+
 def analyze_series(
     timestamps: list[str],
     values: list[float],
@@ -73,6 +135,7 @@ def analyze_series(
     merge_gap: int = 2,
     baseline_policy: str = "rolling",
     rebase_after: int | None = None,
+    gap_reset_factor: float | None = None,
 ) -> dict[str, Any]:
     """执行检测并返回可 JSON 序列化的完整结果。
 
@@ -83,9 +146,13 @@ def analyze_series(
     :param rebase_after: guarded 模式下触发基线重建的连续异常点数，
         默认取 ``min_window``，且必须不小于 ``min_window``；
         rolling 模式忽略该参数
+    :param gap_reset_factor: 大于 1 时启用采样断档感知：以相邻点正时间差
+        的中位数为常规采样间隔，间隔超过该倍数即切分新分段，每段独立预热
+        与维护基线状态；为 None（默认）时保持原有整体检测行为
     """
     n = len(values)
-    # 每个被评估点的注解；前 min_window 个点没有足够基线，不参与评估
+    # 每个被评估点的注解；预热点（未启用断档时为前 min_window 个点）没有
+    # 足够基线，不参与评估
     annotations: list[dict[str, Any] | None] = [None] * n
     is_anomaly = [False] * n
     zscores: list[float | None] = [None] * n
@@ -94,45 +161,81 @@ def analyze_series(
     baseline_rebuild_count = 0
 
     evaluated_start = min_window
-    if baseline_policy == "guarded":
-        if rebase_after is None:
-            rebase_after = min_window
-        baseline_rebuild_count = _run_guarded(
-            timestamps=timestamps,
-            values=values,
-            window_size=window_size,
-            min_window=min_window,
-            threshold=threshold,
-            rebase_after=rebase_after,
-            annotations=annotations,
-            is_anomaly=is_anomaly,
-            zscores=zscores,
-            baseline_windows=baseline_windows,
-        )
-    else:
-        _run_rolling(
-            timestamps=timestamps,
-            values=values,
-            window_size=window_size,
-            min_window=min_window,
-            threshold=threshold,
-            annotations=annotations,
-            is_anomaly=is_anomaly,
-            zscores=zscores,
+    if baseline_policy == "guarded" and rebase_after is None:
+        rebase_after = min_window
+
+    sampling_segments, gap_boundaries, median_interval = _compute_sampling_segments(
+        timestamps, gap_reset_factor
+    )
+
+    for seg_id, (seg_start, seg_end) in enumerate(sampling_segments):
+        if seg_end - seg_start <= min_window:
+            # 分段内点数不足以完成预热：该段没有任何被评估点
+            continue
+        if baseline_policy == "guarded":
+            baseline_rebuild_count += _run_guarded(
+                timestamps=timestamps,
+                values=values,
+                window_size=window_size,
+                min_window=min_window,
+                threshold=threshold,
+                rebase_after=rebase_after,
+                range_start=seg_start,
+                range_end=seg_end,
+                annotations=annotations,
+                is_anomaly=is_anomaly,
+                zscores=zscores,
+                baseline_windows=baseline_windows,
+                segment_id=seg_id,
+            )
+        else:
+            _run_rolling(
+                timestamps=timestamps,
+                values=values,
+                window_size=window_size,
+                min_window=min_window,
+                threshold=threshold,
+                range_start=seg_start,
+                range_end=seg_end,
+                annotations=annotations,
+                is_anomaly=is_anomaly,
+                zscores=zscores,
+                segment_id=seg_id,
+            )
+
+    # 每个采样分段独立扫描异常点，区间不可能跨越断档合并
+    segments: list[dict[str, Any]] = []
+    for seg_id, (seg_start, seg_end) in enumerate(sampling_segments):
+        if seg_end - seg_start <= min_window:
+            continue
+        segments.extend(
+            _build_segments(
+                timestamps=timestamps,
+                values=values,
+                is_anomaly=is_anomaly,
+                zscores=zscores,
+                annotations=annotations,
+                baseline_windows=baseline_windows,
+                window_size=window_size,
+                threshold=threshold,
+                merge_gap=merge_gap,
+                evaluated_start=seg_start + min_window,
+                range_end=seg_end,
+                range_lo=seg_start,
+                segment_id=seg_id if gap_reset_factor is not None else None,
+            )
         )
 
-    segments = _build_segments(
-        timestamps=timestamps,
-        values=values,
-        is_anomaly=is_anomaly,
-        zscores=zscores,
-        annotations=annotations,
-        baseline_windows=baseline_windows,
-        window_size=window_size,
-        threshold=threshold,
-        merge_gap=merge_gap,
-        evaluated_start=evaluated_start,
-    )
+    evaluated_indices = [i for i, ann in enumerate(annotations) if ann is not None]
+    if gap_reset_factor is None:
+        # 未启用断档感知时保持历史输出：前 min_window 个点不评分的连续区间
+        evaluated_point_count = max(0, n - evaluated_start)
+        anomaly_point_count = sum(1 for i in range(evaluated_start, n) if is_anomaly[i])
+        output_points = [annotations[i] for i in range(evaluated_start, n)]
+    else:
+        evaluated_point_count = len(evaluated_indices)
+        anomaly_point_count = sum(1 for i in evaluated_indices if is_anomaly[i])
+        output_points = [annotations[i] for i in evaluated_indices]
 
     return {
         "point_count": n,
@@ -144,12 +247,16 @@ def analyze_series(
         # rolling 不使用 rebase_after，统一回显 null；guarded 回显生效值
         "rebase_after": rebase_after if baseline_policy == "guarded" else None,
         "baseline_rebuild_count": baseline_rebuild_count,
+        "gap_reset_factor": gap_reset_factor,
+        "estimated_interval_seconds": median_interval,
+        "sampling_segment_count": len(sampling_segments),
+        "gap_boundaries": gap_boundaries,
         "evaluated_start_index": evaluated_start,
-        "evaluated_point_count": max(0, n - evaluated_start),
-        "anomaly_point_count": sum(1 for i in range(evaluated_start, n) if is_anomaly[i]),
+        "evaluated_point_count": evaluated_point_count,
+        "anomaly_point_count": anomaly_point_count,
         "anomaly_segment_count": len(segments),
         "segments": segments,
-        "points": [annotations[i] for i in range(evaluated_start, n)],
+        "points": output_points,
     }
 
 
@@ -160,14 +267,20 @@ def _run_rolling(
     window_size: int,
     min_window: int,
     threshold: float,
+    range_start: int,
+    range_end: int,
     annotations: list[dict[str, Any] | None],
     is_anomaly: list[bool],
     zscores: list[float | None],
+    segment_id: int = 0,
 ) -> None:
-    """rolling 策略：所有历史点一律滑入 trailing window。"""
-    n = len(values)
-    for i in range(min_window, n):
-        lo = max(0, i - window_size)
+    """rolling 策略：所有历史点一律滑入 trailing window。
+
+    仅评估 ``[range_start + min_window, range_end)`` 内的点，基线也只取
+    本采样分段（``[range_start, i)``）内的点，分段从头预热。
+    """
+    for i in range(range_start + min_window, range_end):
+        lo = max(range_start, i - window_size)
         history = values[lo:i]
         med, mad, robust_sd, dispersion_method = _window_stats(history)
         z, degenerate = _zscore(values[i], med, robust_sd)
@@ -188,6 +301,7 @@ def _run_rolling(
             # rolling 不区分代次，也不发生重建
             "baseline_generation": 0,
             "baseline_reset": False,
+            "segment": segment_id,
         }
 
 
@@ -199,26 +313,30 @@ def _run_guarded(
     min_window: int,
     threshold: float,
     rebase_after: int,
+    range_start: int,
+    range_end: int,
     annotations: list[dict[str, Any] | None],
     is_anomaly: list[bool],
     zscores: list[float | None],
     baseline_windows: list[tuple[int, ...] | None],
+    segment_id: int = 0,
 ) -> int:
     """guarded 策略：只有正常点进入基线，长异常段触发重建。
 
+    仅评估 ``[range_start + min_window, range_end)`` 内的点；基线种子、
+    连续异常计数与重建代次都以本采样分段为界从头开始。
     返回基线重建（代次递增）次数。
     """
-    n = len(values)
     # 基线只容纳已接纳点的索引（重建后为异常段末尾的 min_window 个点）；
     # 正常点滑入、异常点排除，因此成员索引在原序列上可能不连续。
-    accepted: deque[int] = deque(range(min_window))
+    accepted: deque[int] = deque(range(range_start, range_start + min_window))
     generation = 0
     consecutive_anomalies = 0
     rebuild_count = 0
     # 连续异常期间 accepted 不变，多个异常点可共享同一份窗口成员快照
     window_snapshot: tuple[int, ...] | None = tuple(accepted)
 
-    for i in range(min_window, n):
+    for i in range(range_start + min_window, range_end):
         members = tuple(accepted)
         history = [values[k] for k in members]
         med, mad, robust_sd, dispersion_method = _window_stats(history)
@@ -266,6 +384,7 @@ def _run_guarded(
             "is_anomaly": anomaly,
             "baseline_generation": scoring_generation,
             "baseline_reset": reset,
+            "segment": segment_id,
         }
 
     return rebuild_count
@@ -282,10 +401,16 @@ def _build_segments(
     threshold: float,
     merge_gap: int,
     evaluated_start: int,
+    range_end: int | None = None,
+    range_lo: int = 0,
+    segment_id: int | None = None,
     baseline_windows: list[tuple[int, ...] | None] | None = None,
 ) -> list[dict[str, Any]]:
-    """扫描异常布尔序列，按 merge_gap 合并相邻异常点为区间。"""
-    n = len(values)
+    """扫描异常布尔序列，按 merge_gap 合并相邻异常点为区间。
+
+    只扫描 ``[evaluated_start, range_end)``，因此区间不会跨越采样断档。
+    """
+    n = len(values) if range_end is None else range_end
     segments: list[dict[str, Any]] = []
     i = evaluated_start
 
@@ -315,6 +440,8 @@ def _build_segments(
                 annotations=annotations,
                 window_size=window_size,
                 threshold=threshold,
+                range_lo=range_lo,
+                segment_id=segment_id,
                 baseline_windows=baseline_windows,
             )
         )
@@ -334,6 +461,8 @@ def _describe_segment(
     annotations: list[dict[str, Any] | None],
     window_size: int,
     threshold: float,
+    range_lo: int = 0,
+    segment_id: int | None = None,
     baseline_windows: list[tuple[int, ...] | None] | None = None,
 ) -> dict[str, Any]:
     """构造单个异常区间：基线、分数、触发点与解释。"""
@@ -345,7 +474,7 @@ def _describe_segment(
         base_lo, base_hi = member_indices[0], member_indices[-1] + 1
         baseline = [values[k] for k in member_indices]
     else:
-        base_lo = max(0, seg_start - window_size)
+        base_lo = max(range_lo, seg_start - window_size)
         base_hi = seg_start
         baseline = [values[k] for k in range(base_lo, base_hi)]
     med, mad, robust_sd, dispersion_method = _window_stats(baseline)
@@ -411,7 +540,7 @@ def _describe_segment(
         f"平均 |z|={mean_abs_z:.2f}，判定阈值 {threshold:g}。"
     )
 
-    return {
+    result = {
         "start_index": seg_start,
         "end_index": seg_end,
         "start_time": timestamps[seg_start],
@@ -438,3 +567,6 @@ def _describe_segment(
         "triggers": triggers,
         "explanation": explanation,
     }
+    if segment_id is not None:
+        result["segment"] = segment_id
+    return result
